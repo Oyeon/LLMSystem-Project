@@ -94,8 +94,6 @@ if __name__ == '__main__':
     # Parse args
     args = parser.parse_args()
 
-    # Initialize DeepSpeed distributed
-    deepspeed.init_distributed()
     
     # 1) Load data + embeddings
     with open(f"node_emb/{args.dataset}_node_emb.pkl", "rb") as f:
