@@ -16,9 +16,14 @@ import argparse
 #                     help="Quantization method (default: 4bit)")
 # args = parser.parse_args()
 
+debugging = False #Set this flag to True when debugging
+
 batch_size = 1
-quantization = ["none", "4bit", "8bit"][1]
+#Change default quantization
+quantization = ["none", "4bit", "8bit"][2]
+#Set huggingface cache location here
 cache_dir = os.getcwd() 
+cache_dir = "/scratch/vma5214/deepseek/"
 if cache_dir:
     os.environ['TRANSFORMERS_CACHE'] = cache_dir
     os.environ['HF_DATASETS_CACHE'] = cache_dir
@@ -113,7 +118,8 @@ for key in dataset[0].keys():
     print(f"- {key}")
 
 # For testing with limited resources, you can use a subset
-dataset = dataset.select(range(min(2, len(dataset))))
+if debugging:
+    dataset = dataset.select(range(min(1, len(dataset))))
 
 # Set inference parameters
 # batch_size = args.batch_size
