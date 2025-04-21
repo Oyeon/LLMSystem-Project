@@ -152,12 +152,12 @@ def prepare_batch(tokenizer, all_result, num_train_samples, max_node_num):
             neg_enc = tokenizer(negative_samples)
             for pi, pa, ni, na in zip(pos_enc.input_ids, pos_enc.attention_mask, neg_enc.input_ids, neg_enc.attention_mask):
                 result.append({
-                    'pos_input_ids': pi,
-                    'pos_attention_mask': pa,
-                    'pos_labels': pi,
-                    'neg_input_ids': ni,
-                    'neg_attention_mask': na,
-                    'neg_labels': ni
+                    'pos_input_ids': torch.tensor(pi, dtype=torch.long),
+                    'pos_attention_mask': torch.tensor(pa, dtype=torch.long),
+                    'pos_labels': torch.tensor(pi, dtype=torch.long),
+                    'neg_input_ids': torch.tensor(ni, dtype=torch.long),
+                    'neg_attention_mask': torch.tensor(na, dtype=torch.long),
+                    'neg_labels': torch.tensor(ni, dtype=torch.long)
                 })
     return result
 

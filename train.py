@@ -1,4 +1,4 @@
-# train.py
+# train_hf.py
 import os
 import json
 import torch
@@ -11,6 +11,9 @@ from collections import defaultdict
 
 np.random.seed(0)
 
+# Import HuggingFace Trainer
+from transformers import Trainer, TrainingArguments
+
 import deepspeed
 from peft import (
     LoraConfig,
@@ -22,6 +25,8 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig
 )
+
+from transformers.integrations import HfDeepSpeedConfig
 from accelerate import dispatch_model
 
 from model import MAGDi  # your custom class
@@ -29,40 +34,87 @@ import utils            # your utility file
 import data_utils       # your data collator or loading utilities
 import networkx as nx
 
+# Add this before loading the model
+import os
+os.environ['TRITON_CACHE_DIR'] = '/ocean/projects/cis240137p/adas11/triton_cache'
+os.environ['BITSANDBYTES_CEXTENSION_PATH'] = '/ocean/projects/cis240137p/adas11/bnb_cache'
+os.environ['PYTORCH_KERNEL_CACHE_PATH'] = '/ocean/projects/cis240137p/adas11/pytorch_kernel_cache'
+os.environ['TORCH_EXTENSIONS_DIR'] = '/ocean/projects/cis240137p/adas11/project/torch_extensions'
+os.environ['HF_HOME'] = "/ocean/projects/cis240137p/adas11/hf_cache"
+
 torch.cuda.empty_cache()
 
-def train_one_epoch(model, dataloader, optimizer):
-    model.train()
-    total_loss = 0.0
-
-    for step, batch_data in enumerate(dataloader):
-        batch, graph = batch_data
+# Create a custom dataset class
+class MAGDataset(torch.utils.data.Dataset):
+    def __init__(self, batch_data, graphs):
+        self.batch_data = batch_data
+        self.graphs = graphs
+    
+    def __len__(self):
+        return len(self.batch_data)
+    
+    def __getitem__(self, idx):
+        item = self.batch_data[idx]
+        graph = self.graphs[idx]
         
-        # Custom forward:
+        # Convert lists to tensors if needed
+        for key, value in item.items():
+            if isinstance(value, list):
+                item[key] = torch.tensor(value, dtype=torch.long)
+        
+        return {
+            "pos_input_ids": item["pos_input_ids"],
+            "pos_attention_mask": item["pos_attention_mask"], 
+            "pos_labels": item["pos_labels"],
+            "neg_input_ids": item["neg_input_ids"],
+            "neg_attention_mask": item["neg_attention_mask"],
+            "neg_labels": item["neg_labels"],
+            "graph": graph
+        }
+
+# Create a custom data collator
+class MAGDataCollator:
+    def __call__(self, features):
+        batch = {}
+        graph_batch = []
+        
+        for feature in features:
+            graph_batch.append(feature.pop("graph"))
+        
+        # Process the remaining features into a batch
+        for key in features[0].keys():
+            values = [feature[key] for feature in features]
+            if isinstance(values[0], torch.Tensor):
+                batch[key] = torch.stack(values)
+            else:
+                batch[key] = values
+        
+        batch["graph"] = graph_batch
+        return batch
+
+# Create a custom trainer
+class MAGDiTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         nll_loss, node_loss, mr_loss = model(
-            pos_input_ids=batch["pos_input_ids"],
-            pos_attention_mask=batch["pos_attention_mask"],
-            pos_labels=batch["pos_labels"],
-            neg_input_ids=batch["neg_input_ids"],
-            neg_attention_mask=batch["neg_attention_mask"],
-            neg_labels=batch["neg_labels"],
-            graph=graph
+            pos_input_ids=inputs["pos_input_ids"],
+            pos_attention_mask=inputs["pos_attention_mask"],
+            pos_labels=inputs["pos_labels"],
+            neg_input_ids=inputs["neg_input_ids"],
+            neg_attention_mask=inputs["neg_attention_mask"],
+            neg_labels=inputs["neg_labels"],
+            graph=inputs["graph"]
         )
+        
         loss = nll_loss + node_loss + mr_loss
-
-        # DeepSpeed handles backward and optimizer.step()
-        model.backward(loss)
-        model.step()
-
-        total_loss += loss.item()
-
-    return total_loss / len(dataloader)
-
+        
+        if return_outputs:
+            return loss, (nll_loss, node_loss, mr_loss)
+        return loss
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='SQA', type=str)
-    parser.add_argument('--model_name', default='deepseek-ai/DeepSeek-Coder-V2-Lite-Base', type=str)
+    parser.add_argument('--model_name', default='deepseek-ai/DeepSeek-V2-Lite', type=str)
     parser.add_argument('--gcn_in_channels', default=2048, type=int)
     parser.add_argument('--gcn_hidden_channels', default=512, type=int)
     parser.add_argument('--gcn_out_channels', default=3, type=int)
@@ -76,7 +128,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', default=1, type=int)
     
     # Add QLoRA parameters
-    parser.add_argument('--bits', type=int, default=8,
+    parser.add_argument('--bits', type=int, default=4,
                         help='Quantization bits (4 or 8)')
     parser.add_argument('--lora_r', type=int, default=16,
                         help='LoRA rank')
@@ -93,7 +145,6 @@ if __name__ == '__main__':
     
     # Parse args
     args = parser.parse_args()
-
     
     # 1) Load data + embeddings
     with open(f"node_emb/{args.dataset}_node_emb.pkl", "rb") as f:
@@ -108,10 +159,19 @@ if __name__ == '__main__':
         args.max_node_num,
         -1
     )
-    node_embeddings = torch.tensor(node_embeddings, dtype=torch.float32)
+    compute_dtype = torch.float16
+    node_embeddings = torch.tensor(node_embeddings, dtype=compute_dtype)
+    
+    # Initialize distributed training if needed
+    if args.local_rank != -1:
+        deepspeed.init_distributed()
+        torch.cuda.set_device(args.local_rank)
+        print(f"Process rank: {torch.distributed.get_rank()}, using GPU: {args.local_rank}")
+    
+    dschf = HfDeepSpeedConfig(args.deepspeed_config)  # keep this object alive
 
     # 2) QLoRA: Configure BitsAndBytes 8-bit quantization
-    compute_dtype = torch.float32
+
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=args.bits == 4,
@@ -121,13 +181,13 @@ if __name__ == '__main__':
         bnb_4bit_quant_type="nf4",       # Normalized Float 4 for better accuracy
     )
 
-    # 3) Load base model in 4-bit
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         trust_remote_code=True,
         quantization_config=bnb_config,
         torch_dtype=compute_dtype,
-        device_map="auto"
+        low_cpu_mem_usage=True,
+        device_map="cuda"  # Place on first GPU
     )
 
     # 4) Prepare for k-bit training
@@ -164,7 +224,7 @@ if __name__ == '__main__':
     )
     
     model.decoder = get_peft_model(model.decoder, lora_config)
-    model.decoder.gradient_checkpointing_enable()
+#    model.decoder.gradient_checkpointing_enable()
 
     # 7) Prepare data + tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -182,6 +242,8 @@ if __name__ == '__main__':
         args.max_node_num
     )
 
+    print("Sample batch item:", training_batch[0])
+
     graphs = utils.construct_graphs(
         all_result,
         node_embeddings,
@@ -190,73 +252,45 @@ if __name__ == '__main__':
     )
     training_batch, graphs = utils.pad_graphs(training_batch, graphs)
 
-    dataset = list(zip(training_batch, graphs))
-
-    # Custom collate function to properly handle batching
-    def collate_fn(samples):
-        batch_list, graph_list = [], []
-        for s in samples:
-            batch_list.append(s[0])
-            graph_list.append(s[1])
-        
-        # Process batch_list to combine dictionary values
-        combined_batch = defaultdict(list)
-        for batch in batch_list:
-            for k, v in batch.items():
-                combined_batch[k].append(v)
-        
-        # Stack tensors or concatenate as appropriate
-        for k in combined_batch:
-            if isinstance(combined_batch[k][0], torch.Tensor):
-                combined_batch[k] = torch.stack(combined_batch[k])
-        
-        return combined_batch, graph_list
-
-    # Create DataLoader with distributed sampler
-    from torch.utils.data import DataLoader, DistributedSampler
+    # Create dataset
+    dataset = MAGDataset(training_batch, graphs)
     
-    # Create distributed sampler
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=torch.distributed.get_world_size(),
-        rank=torch.distributed.get_rank(),
-        shuffle=True
-    )
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        collate_fn=collate_fn
+    # Create training arguments
+    training_args = TrainingArguments(
+        output_dir=f"MAGDi_{args.dataset}_checkpoints",
+        num_train_epochs=args.num_epochs,
+        per_device_train_batch_size=args.batch_size,
+        learning_rate=args.lr,
+        logging_dir="./logs",
+        logging_steps=10,
+        save_strategy="epoch",
+        # deepspeed=args.deepspeed_config,
+        gradient_checkpointing_kwargs={'use_reentrant':False},
+        local_rank=args.local_rank,
+        fp16=True,
+        save_total_limit=2,
+        remove_unused_columns=False,  # Important for custom datasets
     )
 
-    # 8) Initialize DeepSpeed engine
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args,
+    # Create trainer
+    trainer = MAGDiTrainer(
         model=model,
-        model_parameters=[p for p in model.parameters() if p.requires_grad],
-        config=args.deepspeed_config
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=MAGDataCollator(),
     )
 
-    # 9) Train loop
-    for epoch in range(args.num_epochs):
-        # Set dataloader sampler's epoch for deterministic shuffling
-        dataloader.sampler.set_epoch(epoch)
-            
-        avg_loss = train_one_epoch(model_engine, dataloader, optimizer)
-        
-        # Only print from rank 0
-        if torch.distributed.get_rank() == 0:
-            print(f"Epoch {epoch+1}/{args.num_epochs} - Loss: {avg_loss:.4f}")
+    # Train
+    trainer.train()
 
-    # After line 260, add:
-    if torch.distributed.get_rank() == 0:
+    # Save model
+    if trainer.is_world_process_zero():
         # Save LoRA adapters
         output_dir = f"MAGDi_{args.dataset}_qlora_adapters"
-        model_engine.module.decoder.save_pretrained(output_dir)
+        trainer.model.decoder.save_pretrained(output_dir)
         
         # Also save quantization and model configuration
-        model_engine.module.decoder.config.save_pretrained(output_dir)
+        trainer.model.decoder.config.save_pretrained(output_dir)
         
         # Merge adapters into the base model
         print("Merging LoRA adapters into base model...")

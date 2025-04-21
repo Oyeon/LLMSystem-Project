@@ -7,16 +7,25 @@ from torch_geometric.nn import GCNConv, Linear
 from torch.nn import CrossEntropyLoss, MarginRankingLoss
 
 class GCN(torch.nn.Module):
-    def __init__(self, dim_in, dim_h, dim_out):
+    def __init__(self, dim_in, dim_h, dim_out, dtype=torch.float16):
         super().__init__()
         self.gcn1 = GCNConv(dim_in, dim_h)
         self.gcn2 = GCNConv(dim_h, dim_out)
+        self.dtype = dtype
     
     def forward(self, x, edge_index):
+        # Make sure inputs are in the right dtype
+        # GCNConv may need float32 internally, so we need to convert
+        x_dtype = x.dtype
         x = self.gcn1(x, edge_index)
         x = torch.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.gcn2(x, edge_index)
+        
+        # Convert back to original dtype if needed
+        if x.dtype != x_dtype:
+            x = x.to(x_dtype)
+            
         return x, F.log_softmax(x, dim=1)
 
 class MAGDi(torch.nn.Module):
@@ -32,11 +41,15 @@ class MAGDi(torch.nn.Module):
         gcn_out_channels,
         alpha,
         beta,
-        gamma
+        gamma,
+        torch_dtype=torch.float16
     ):
         super().__init__()
         self.decoder = base_model  # The 8-bit base model
-        self.gcn = GCN(gcn_in_channels, gcn_hidden_channels, gcn_out_channels)
+        self.dtype = torch_dtype  # Default dtype
+
+        self.gcn = GCN(gcn_in_channels, gcn_hidden_channels, gcn_out_channels, dtype=self.dtype)
+
 
         self.mlp1 = Linear(self.decoder.config.hidden_size, self.decoder.config.hidden_size)
         self.mlp2 = Linear(self.decoder.config.hidden_size, 1)
@@ -57,7 +70,7 @@ class MAGDi(torch.nn.Module):
         graph
     ):
 
-        device = pos_input_ids.device
+        device = pos_input_ids[0].device
 
         # 1) Graph
         loader = DataLoader(graph, batch_size=len(graph), shuffle=False, pin_memory=False, num_workers=0)
@@ -76,7 +89,7 @@ class MAGDi(torch.nn.Module):
         neg_output = self.decoder(
             input_ids=neg_input_ids,
             attention_mask=neg_attention_mask,
-            labels=None,
+            labels=neg_labels,
             output_hidden_states=True
         )
 

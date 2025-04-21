@@ -13,7 +13,7 @@ def generate_node_embeddings(
     input_json="MAG/SQA_1000.json",
     output_pkl="node_emb/SQA_node_emb.pkl",
     model_name="deepseek-ai/DeepSeek-V2-Lite",
-    batch_size=1
+    batch_size=8
 ):
     """
     Generates node embeddings from the final hidden layer of the DeepSeek model
@@ -48,8 +48,9 @@ def generate_node_embeddings(
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quantization_config,
+        
         trust_remote_code=True,
-        max_memory={0: "23GB", "cpu": "10GB"}  # Limit CPU memory usage
+        device_map="auto"
     )
     
     model.eval()
@@ -133,7 +134,7 @@ if __name__ == "__main__":
     parser.add_argument('--input_json', type=str, default="MAG/SQA_1000.json")
     parser.add_argument('--output_pkl', type=str, default="node_emb/SQA_node_emb.pkl")
     parser.add_argument('--model_name', type=str, default="deepseek-ai/DeepSeek-V2-Lite")
-    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=32)
     
     args = parser.parse_args()
     
