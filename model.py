@@ -108,7 +108,7 @@ class MAGDi(torch.nn.Module):
         pos_input = self.mlp2(pos_h)
         neg_input = self.mlp2(neg_h)
         
-        mr_loss, pos_score, neg_score = self.fused_tanh_marginloss(pos_input, neg_input)
+        mr_loss = self.fused_tanh_marginloss(pos_input, neg_input)
 
         # 6) GCN
         gcn_out, logits = self.gcn(graph_batch.x, graph_batch.edge_index)
