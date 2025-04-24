@@ -6,6 +6,9 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, Linear
 from torch.nn import CrossEntropyLoss, MarginRankingLoss
 
+# Import our fused kernel module
+from fused_tanh_margin import FusedTanhMarginloss
+
 class GCN(torch.nn.Module):
     def __init__(self, dim_in, dim_h, dim_out):
         super().__init__()
@@ -32,7 +35,8 @@ class MAGDi(torch.nn.Module):
         gcn_out_channels,
         alpha,
         beta,
-        gamma
+        gamma,
+        use_fused_kernel=True  # New parameter to enable/disable the fused kernel
     ):
         super().__init__()
         self.decoder = base_model  # The 8-bit base model
@@ -45,6 +49,9 @@ class MAGDi(torch.nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        
+        # Initialize our fused tanh + margin ranking loss module
+        self.fused_tanh_marginloss = FusedTanhMarginloss(margin=1.0, use_fused_kernel=use_fused_kernel)
         
     def forward(
         self,
@@ -95,14 +102,13 @@ class MAGDi(torch.nn.Module):
             
         # MLP
         pos_h = torch.relu(self.mlp1(pos_seq_emb))
-        pos_score = torch.tanh(self.mlp2(pos_h))
-
         neg_h = torch.relu(self.mlp1(neg_seq_emb))
-        neg_score = torch.tanh(self.mlp2(neg_h))
-
-        # 5) MarginRankingLoss
-        mr_cri = MarginRankingLoss(1.0, reduction='mean').to(device)
-        mr_loss = mr_cri(pos_score, neg_score, torch.ones_like(pos_score).to(device))
+        
+        # Replace the separate tanh and MarginRankingLoss with our fused implementation
+        pos_input = self.mlp2(pos_h)
+        neg_input = self.mlp2(neg_h)
+        
+        mr_loss, pos_score, neg_score = self.fused_tanh_marginloss(pos_input, neg_input)
 
         # 6) GCN
         gcn_out, logits = self.gcn(graph_batch.x, graph_batch.edge_index)
@@ -123,9 +129,6 @@ class MAGDi(torch.nn.Module):
         sum_embeddings = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
         denom = torch.sum(weights, dim=1).unsqueeze(-1)
         return sum_embeddings / denom
-
-
-
 
 # import torch
 # import logging
