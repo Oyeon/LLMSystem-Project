@@ -27,6 +27,7 @@ from transformers import (
 )
 
 from transformers.integrations import HfDeepSpeedConfig
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from accelerate import dispatch_model
 
 from model import MAGDi  # your custom class
@@ -74,21 +75,77 @@ class MAGDataset(torch.utils.data.Dataset):
 
 # Create a custom data collator
 class MAGDataCollator:
+    # You might need the tokenizer for the pad_token_id
+    def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        self.tokenizer = tokenizer
+
     def __call__(self, features):
-        batch = {}
-        graph_batch = []
-        
+        # Separate graph data first
+        graph_batch = [feature.pop("graph") for feature in features]
+
+        # --- Determine Max Sequence Length ---
+        max_pos_len = 0
+        max_neg_len = 0
         for feature in features:
-            graph_batch.append(feature.pop("graph"))
-        
-        # Process the remaining features into a batch
-        for key in features[0].keys():
-            values = [feature[key] for feature in features]
-            if isinstance(values[0], torch.Tensor):
-                batch[key] = torch.stack(values)
+            # Ensure they are tensors before checking length
+            if isinstance(feature["pos_input_ids"], list):
+                 feature["pos_input_ids"] = torch.tensor(feature["pos_input_ids"], dtype=torch.long)
+            if isinstance(feature["neg_input_ids"], list):
+                 feature["neg_input_ids"] = torch.tensor(feature["neg_input_ids"], dtype=torch.long)
+            max_pos_len = max(max_pos_len, len(feature["pos_input_ids"]))
+            max_neg_len = max(max_neg_len, len(feature["neg_input_ids"]))
+
+        # Determine the overall max length needed for concatenation
+        max_length = max(max_pos_len, max_neg_len)
+
+        # --- Pad Features ---
+        padded_features = []
+        for feature in features:
+            padded_feature = {}
+            for key, value in feature.items():
+                if key in ["pos_input_ids", "neg_input_ids"]:
+                    # Pad sequences to max_length
+                    difference = max_length - len(value)
+                    padded_sequence = torch.cat([value, torch.tensor([self.tokenizer.pad_token_id] * difference, dtype=torch.long)])
+                    padded_feature[key] = padded_sequence
+                elif key in ["pos_attention_mask", "neg_attention_mask"]:
+                     # Ensure mask is tensor
+                     if isinstance(value, list):
+                         value = torch.tensor(value, dtype=torch.long)
+                     # Pad attention mask with 0s
+                     difference = max_length - len(value)
+                     padded_mask = torch.cat([value, torch.tensor([0] * difference, dtype=torch.long)])
+                     padded_feature[key] = padded_mask
+                elif key in ["pos_labels", "neg_labels"]:
+                     # Pad labels with -100 (ignore index)
+                     if isinstance(value, list):
+                         value = torch.tensor(value, dtype=torch.long)
+                     difference = max_length - len(value)
+                     padded_labels = torch.cat([value, torch.tensor([-100] * difference, dtype=torch.long)])
+                     padded_feature[key] = padded_labels
+                else:
+                    # Keep other features as they are (assuming they don't need padding)
+                     if isinstance(value, list): # Ensure other list items become tensors if needed later
+                         try:
+                             padded_feature[key] = torch.tensor(value)
+                         except Exception: # Fallback if conversion fails
+                             padded_feature[key] = value
+                     else:
+                        padded_feature[key] = value
+            padded_features.append(padded_feature)
+
+        # --- Stack Padded Features ---
+        batch = {}
+        # Now that all sequences have the same length, stacking should work
+        first = padded_features[0]
+        for key in first.keys():
+            if isinstance(first[key], torch.Tensor):
+                batch[key] = torch.stack([f[key] for f in padded_features])
             else:
-                batch[key] = values
-        
+                # Handle non-tensor features if any (shouldn't be sequence data)
+                batch[key] = [f[key] for f in padded_features]
+
+        # Add the graph batch back
         batch["graph"] = graph_batch
         return batch
 
@@ -277,7 +334,7 @@ if __name__ == '__main__':
         model=model,
         args=training_args,
         train_dataset=dataset,
-        data_collator=MAGDataCollator(),
+        data_collator=MAGDataCollator(tokenizer=tokenizer),
     )
 
     # Train
