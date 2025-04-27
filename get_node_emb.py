@@ -10,7 +10,7 @@ import utils  # must contain generate_ordered_list(...) for your SQA data
 def generate_node_embeddings(
     input_json="MAG/SQA_1000.json",
     output_pkl="node_emb/SQA_node_emb.pkl",
-    model_name="deepseek-ai/DeepSeek-Coder-V2-Lite-Base",
+    model_name='mistralai/Mistral-7B-Instruct-v0.2',
     batch_size=50
 ):
     """
@@ -44,7 +44,7 @@ def generate_node_embeddings(
 
     # Confirm hidden size is 2048:
     print("Model hidden_size from config:", model.config.hidden_size)
-    assert model.config.hidden_size == 2048, (
+    assert model.config.hidden_size == 4096, (
         "It appears the model does not have a 2048 hidden size. "
         "If it's actually 4096, you need to change your GCN config and reshape logic accordingly."
     )
@@ -102,8 +102,8 @@ if __name__ == "__main__":
     generate_node_embeddings(
         input_json="MAG/SQA_1000.json",         # your SQA data
         output_pkl="node_emb/SQA_node_emb.pkl", # store new 2048-dim embeddings
-        model_name="deepseek-ai/DeepSeek-Coder-V2-Lite-Base",
-        batch_size=1
+        model_name='mistralai/Mistral-7B-Instruct-v0.2',
+        batch_size=2
     )
 
 

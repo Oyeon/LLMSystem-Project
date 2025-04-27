@@ -69,8 +69,8 @@ def train_one_epoch(model, dataloader, optimizer):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='SQA', type=str)
-    parser.add_argument('--model_name', default='deepseek-ai/DeepSeek-Coder-V2-Lite-Base', type=str)
-    parser.add_argument('--gcn_in_channels', default=2048, type=int)
+    parser.add_argument('--model_name', default='mistralai/Mistral-7B-Instruct-v0.2', type=str)
+    parser.add_argument('--gcn_in_channels', default=4096, type=int)
     parser.add_argument('--gcn_hidden_channels', default=512, type=int)
     parser.add_argument('--gcn_out_channels', default=3, type=int)
     parser.add_argument('--alpha', default=1.0, type=float)
