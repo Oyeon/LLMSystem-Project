@@ -1,132 +1,124 @@
-# model.py
+
+#################################################################################### 
+#### Fuse
+# model.py  –  v1.2
+# ------------------------------------------------------------------
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, Linear
-from torch.nn import CrossEntropyLoss, MarginRankingLoss
+from transformers import AutoModelForCausalLM, Trainer
 
-class GCN(torch.nn.Module):
-    def __init__(self, dim_in, dim_h, dim_out):
+
+class GCN(nn.Module):
+    def __init__(self, dim_in: int, dim_h: int, dim_out: int):
         super().__init__()
         self.gcn1 = GCNConv(dim_in, dim_h)
         self.gcn2 = GCNConv(dim_h, dim_out)
-    
+
     def forward(self, x, edge_index):
         x = self.gcn1(x, edge_index)
-        x = torch.relu(x)
+        x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.gcn2(x, edge_index)
         return x, F.log_softmax(x, dim=1)
 
-class MAGDi(torch.nn.Module):
-    """
-    Updated to accept `base_model` as a parameter:
-    it should be an AutoModelForCausalLM that was loaded in 8-bit.
-    """
+
+class MAGDi(nn.Module):
     def __init__(
         self,
-        base_model,
-        gcn_in_channels,
-        gcn_hidden_channels,
-        gcn_out_channels,
-        alpha,
-        beta,
-        gamma
+        model_name: str,
+        gcn_in_channels: int,
+        gcn_hidden_channels: int,
+        gcn_out_channels: int,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        gamma: float = 0.1,
     ):
         super().__init__()
-        self.decoder = base_model  # The 8-bit base model
+        self.decoder = AutoModelForCausalLM.from_pretrained(model_name)
         self.gcn = GCN(gcn_in_channels, gcn_hidden_channels, gcn_out_channels)
-
-        self.mlp1 = Linear(self.decoder.config.hidden_size, self.decoder.config.hidden_size)
+        self.mlp1 = Linear(self.decoder.config.hidden_size,
+                           self.decoder.config.hidden_size)
         self.mlp2 = Linear(self.decoder.config.hidden_size, 1)
-        self.mlp3 = Linear(self.decoder.config.vocab_size, 1)
+        self.alpha, self.beta, self.gamma = alpha, beta, gamma
+        self._mr = nn.MarginRankingLoss(1.0, reduction='mean')
+        self._ce = nn.CrossEntropyLoss()
 
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        
+    # ----------------------------------------------------------
     def forward(
         self,
-        pos_input_ids,
-        pos_attention_mask,
-        pos_labels,
-        neg_input_ids,
-        neg_attention_mask,
-        neg_labels,
-        graph
+        pos_input_ids, pos_attention_mask, pos_labels,
+        neg_input_ids, neg_attention_mask, neg_labels,
+        graph,
+        return_breakdown: bool = False,
     ):
-
         device = pos_input_ids.device
 
-        # 1) Graph
-        loader = DataLoader(graph, batch_size=len(graph), shuffle=False, pin_memory=False, num_workers=0)
-        graph_batch = next(iter(loader)).to(device)
+        # ─ Graph branch
+        # g_batch = next(iter(DataLoader(graph,
+        #                                batch_size=len(graph),
+        #                                shuffle=False,
+        #                                num_workers=0))).to(device)
+        g_batch = graph.to(device)        
+        _, g_logits = self.gcn(g_batch.x, g_batch.edge_index)
+        node_loss = self._ce(g_logits, g_batch.y.to(device))
 
-        # 2) Positive
-        pos_output = self.decoder(
-            input_ids=pos_input_ids,
-            attention_mask=pos_attention_mask,
-            labels=pos_labels,
-            output_hidden_states=True
-        )
-        nll_loss = pos_output["loss"]
+        # ─ Positive / negative passes
+        pos_out = self.decoder(input_ids=pos_input_ids,
+                               attention_mask=pos_attention_mask,
+                               labels=pos_labels,
+                               output_hidden_states=True)
+        nll_loss = pos_out.loss
 
-        # 3) Negative
-        neg_output = self.decoder(
-            input_ids=neg_input_ids,
-            attention_mask=neg_attention_mask,
-            labels=None,
-            output_hidden_states=True
-        )
+        neg_out = self.decoder(input_ids=neg_input_ids,
+                               attention_mask=neg_attention_mask,
+                               output_hidden_states=True)
 
-        # Possibly mask out short negative sequences
-        row_sums = neg_attention_mask.sum(dim=1)
-        neg_mask = row_sums > 5
-        
-        # 4) Mean pool hidden states
-        pos_seq_emb = self._mean_pool(pos_output.hidden_states[-1], pos_attention_mask)
-        neg_seq_emb = self._mean_pool(neg_output.hidden_states[-1], neg_attention_mask)
+        # pooled embeddings
+        pos_all = self._mean_pool(pos_out.hidden_states[-1], pos_attention_mask)
+        neg_all = self._mean_pool(neg_out.hidden_states[-1], neg_attention_mask)
 
-        if neg_mask.any():
-            neg_mask = neg_mask.to(device)
-            pos_seq_emb = pos_seq_emb[neg_mask]
-            neg_seq_emb = neg_seq_emb[neg_mask]
-            
-        # MLP
-        pos_h = torch.relu(self.mlp1(pos_seq_emb))
-        pos_score = torch.tanh(self.mlp2(pos_h))
+        valid = neg_attention_mask.sum(1) > 5                # boolean mask on cuda:0
+        if valid.any():
+            valid = valid.to(pos_all.device)                
+            pos_emb = pos_all[valid]                        
+            neg_emb = neg_all[valid]                        
 
-        neg_h = torch.relu(self.mlp1(neg_seq_emb))
-        neg_score = torch.tanh(self.mlp2(neg_h))
+            pos_score = torch.tanh(self.mlp2(F.relu(self.mlp1(pos_emb))))
+            neg_score = torch.tanh(self.mlp2(F.relu(self.mlp1(neg_emb))))
+            mr_loss = self._mr(pos_score, neg_score,
+                               torch.ones_like(pos_score))
+        else:
+            mr_loss = nll_loss.new_tensor(0.0)
 
-        # 5) MarginRankingLoss
-        mr_cri = MarginRankingLoss(1.0, reduction='mean').to(device)
-        mr_loss = mr_cri(pos_score, neg_score, torch.ones_like(pos_score).to(device))
+        total = self.alpha * nll_loss + self.beta * node_loss + self.gamma * mr_loss
+        if return_breakdown:
+            return total, {"nll": nll_loss.detach(),
+                           "node": node_loss.detach(),
+                           "mr": mr_loss.detach()}
+        return total
 
-        # 6) GCN
-        gcn_out, logits = self.gcn(graph_batch.x, graph_batch.edge_index)
-        graph_batch.y = graph_batch.y.to(device)
-        node_loss = CrossEntropyLoss()(logits, graph_batch.y)
-
-        return (
-            self.alpha * nll_loss,
-            self.beta * node_loss,
-            self.gamma * mr_loss
-        )
-
-    def _mean_pool(self, hidden_states, attention_mask):
-        # Weighted approach as in your code:
-        weights = attention_mask * torch.arange(
-            1, hidden_states.shape[1] + 1, device=hidden_states.device
-        ).unsqueeze(0)
-        sum_embeddings = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
-        denom = torch.sum(weights, dim=1).unsqueeze(-1)
-        return sum_embeddings / denom
+    @staticmethod
+    def _mean_pool(hidden, mask):
+        mask = mask.to(hidden.device)                        # ensure same GPU
+        w = mask * torch.arange(1, hidden.size(1) + 1,
+                                device=hidden.device).unsqueeze(0)
+        return (hidden * w.unsqueeze(-1)).sum(1) / w.sum(1, keepdim=True)
 
 
+class MAGDiTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        if return_outputs:
+            loss, parts = model(return_breakdown=True, **inputs)
+            return loss, parts
+        return model(**inputs)
 
 
+####################################################################################
+### original
 # import torch
 # import logging
 # import torch.nn.functional as F
@@ -151,11 +143,11 @@ class MAGDi(torch.nn.Module):
 
 # class MAGDi(torch.nn.Module):
 
-#     def __init__(self, base_model, gcn_in_channels, gcn_hidden_channels,
+#     def __init__(self, model_name, gcn_in_channels, gcn_hidden_channels,
 #                  gcn_out_channels, alpha, beta, gamma):
 #         super(MAGDi, self).__init__()
-#         # self.decoder = AutoModelForCausalLM.from_pretrained( model_name, cache_dir='./nas-ssd2/cychen/models')
-#         self.decoder = base_model
+#         self.decoder = AutoModelForCausalLM.from_pretrained(
+#             model_name, cache_dir='./nas-ssd2/cychen/models')
 #         self.gcn = GCN(gcn_in_channels, gcn_hidden_channels, gcn_out_channels)
 #         self.mlp1 = Linear(self.decoder.config.hidden_size, self.decoder.config.hidden_size)
 #         self.mlp2 = Linear(self.decoder.config.hidden_size, 1)
@@ -165,13 +157,10 @@ class MAGDi(torch.nn.Module):
 #         self.gamma = gamma
         
 #     def forward(self, pos_input_ids, pos_attention_mask, pos_labels, neg_input_ids, neg_attention_mask, neg_labels, graph):
-
-#         device = pos_input_ids.device      # or next(self.gcn.parameters()).device, etc.
-
+        
 #         graph_loader = DataLoader(graph, batch_size=len(graph), shuffle=False, pin_memory=False, num_workers=0)
 #         graph_batch = next(iter(graph_loader))
-#         graph_batch = graph_batch.to(device)
-
+        
 #         pos_output = self.decoder(input_ids=pos_input_ids,
 #                              attention_mask=pos_attention_mask,
 #                              labels=pos_labels,
@@ -226,7 +215,7 @@ class MAGDi(torch.nn.Module):
 
 # class MAGDiTrainer(Trainer):
 
-#     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+#     def compute_loss(self, model, inputs, return_outputs=False):
       
 #         output = model(pos_input_ids=inputs["pos_input_ids"],
 #                        pos_attention_mask=inputs["pos_attention_mask"],
@@ -240,3 +229,132 @@ class MAGDi(torch.nn.Module):
 #         loss = nll_loss + node_loss + mr_loss
 
 #         return loss
+
+
+####################################################################################
+
+
+# import torch
+# import torch.nn.functional as F
+# from torch_geometric.loader import DataLoader
+# from torch_geometric.nn import GCNConv, Linear
+# from torch.nn import CrossEntropyLoss, MarginRankingLoss
+
+# class GCN(torch.nn.Module):
+#     def __init__(self, dim_in, dim_h, dim_out):
+#         super().__init__()
+#         self.gcn1 = GCNConv(dim_in, dim_h)
+#         self.gcn2 = GCNConv(dim_h, dim_out)
+    
+#     def forward(self, x, edge_index):
+#         x = self.gcn1(x, edge_index)
+#         x = torch.relu(x)
+#         x = F.dropout(x, p=0.5, training=self.training)
+#         x = self.gcn2(x, edge_index)
+#         return x, F.log_softmax(x, dim=1)
+
+# class MAGDi(torch.nn.Module):
+#     """
+#     Updated to accept `base_model` as a parameter:
+#     it should be an AutoModelForCausalLM that was loaded in 8-bit.
+#     """
+#     def __init__(
+#         self,
+#         base_model,
+#         gcn_in_channels,
+#         gcn_hidden_channels,
+#         gcn_out_channels,
+#         alpha,
+#         beta,
+#         gamma
+#     ):
+#         super().__init__()
+#         self.decoder = base_model  # The 8-bit base model
+#         self.gcn = GCN(gcn_in_channels, gcn_hidden_channels, gcn_out_channels)
+
+#         self.mlp1 = Linear(self.decoder.config.hidden_size, self.decoder.config.hidden_size)
+#         self.mlp2 = Linear(self.decoder.config.hidden_size, 1)
+#         self.mlp3 = Linear(self.decoder.config.vocab_size, 1)
+
+#         self.alpha = alpha
+#         self.beta = beta
+#         self.gamma = gamma
+        
+#     def forward(
+#         self,
+#         pos_input_ids,
+#         pos_attention_mask,
+#         pos_labels,
+#         neg_input_ids,
+#         neg_attention_mask,
+#         neg_labels,
+#         graph
+#     ):
+
+#         device = pos_input_ids.device
+
+#         # 1) Graph
+#         loader = DataLoader(graph, batch_size=len(graph), shuffle=False, pin_memory=False, num_workers=0)
+#         graph_batch = next(iter(loader)).to(device)
+
+#         # 2) Positive
+#         pos_output = self.decoder(
+#             input_ids=pos_input_ids,
+#             attention_mask=pos_attention_mask,
+#             labels=pos_labels,
+#             output_hidden_states=True
+#         )
+#         nll_loss = pos_output["loss"]
+
+#         # 3) Negative
+#         neg_output = self.decoder(
+#             input_ids=neg_input_ids,
+#             attention_mask=neg_attention_mask,
+#             labels=None,
+#             output_hidden_states=True
+#         )
+
+#         # Possibly mask out short negative sequences
+#         row_sums = neg_attention_mask.sum(dim=1)
+#         neg_mask = row_sums > 5
+        
+#         # 4) Mean pool hidden states
+#         pos_seq_emb = self._mean_pool(pos_output.hidden_states[-1], pos_attention_mask)
+#         neg_seq_emb = self._mean_pool(neg_output.hidden_states[-1], neg_attention_mask)
+
+#         if neg_mask.any():
+#             neg_mask = neg_mask.to(device)
+#             pos_seq_emb = pos_seq_emb[neg_mask]
+#             neg_seq_emb = neg_seq_emb[neg_mask]
+            
+#         # MLP
+#         pos_h = torch.relu(self.mlp1(pos_seq_emb))
+#         pos_score = torch.tanh(self.mlp2(pos_h))
+
+#         neg_h = torch.relu(self.mlp1(neg_seq_emb))
+#         neg_score = torch.tanh(self.mlp2(neg_h))
+
+#         # 5) MarginRankingLoss
+#         mr_cri = MarginRankingLoss(1.0, reduction='mean').to(device)
+#         mr_loss = mr_cri(pos_score, neg_score, torch.ones_like(pos_score).to(device))
+
+#         # 6) GCN
+#         gcn_out, logits = self.gcn(graph_batch.x, graph_batch.edge_index)
+#         graph_batch.y = graph_batch.y.to(device)
+#         node_loss = CrossEntropyLoss()(logits, graph_batch.y)
+
+#         return (
+#             self.alpha * nll_loss,
+#             self.beta * node_loss,
+#             self.gamma * mr_loss
+#         )
+
+#     def _mean_pool(self, hidden_states, attention_mask):
+#         # Weighted approach as in your code:
+#         weights = attention_mask * torch.arange(
+#             1, hidden_states.shape[1] + 1, device=hidden_states.device
+#         ).unsqueeze(0)
+#         sum_embeddings = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
+#         denom = torch.sum(weights, dim=1).unsqueeze(-1)
+#         return sum_embeddings / denom
+

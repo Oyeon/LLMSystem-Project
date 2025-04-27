@@ -135,31 +135,67 @@ def prepare_contrastive_samples(samples, labels):
 
     return positive_samples, negative_samples
 
-def prepare_batch(tokenizer, all_result, num_train_samples, max_node_num):
+# def prepare_batch(tokenizer, all_result, num_train_samples, max_node_num):
 
+#     ordered_list, labels = generate_ordered_list(all_result)
+#     ordered_list = np.array(ordered_list)
+#     ordered_list = ordered_list.reshape(num_train_samples, max_node_num)
+#     labels = np.array(labels)
+#     labels = labels.reshape(num_train_samples, max_node_num)
+
+#     result = []
+#     for sentence, label in zip(ordered_list, labels):
+#         pairs = prepare_contrastive_samples(sentence, label)
+#         if pairs:
+#             positive_samples, negative_samples = pairs
+#             pos_enc = tokenizer(positive_samples)
+#             neg_enc = tokenizer(negative_samples)
+#             for pi, pa, ni, na in zip(pos_enc.input_ids, pos_enc.attention_mask, neg_enc.input_ids, neg_enc.attention_mask):
+#                 result.append({
+#                     'pos_input_ids': pi,
+#                     'pos_attention_mask': pa,
+#                     'pos_labels': pi,
+#                     'neg_input_ids': ni,
+#                     'neg_attention_mask': na,
+#                     'neg_labels': ni
+#                 })
+#     return result
+
+def prepare_batch(tokenizer, all_result, num_train_samples, max_node_num):
     ordered_list, labels = generate_ordered_list(all_result)
-    ordered_list = np.array(ordered_list)
-    ordered_list = ordered_list.reshape(num_train_samples, max_node_num)
-    labels = np.array(labels)
-    labels = labels.reshape(num_train_samples, max_node_num)
+    ordered_list = np.array(ordered_list).reshape(num_train_samples, max_node_num)
+    labels       = np.array(labels).reshape(num_train_samples, max_node_num)
 
     result = []
-    for sentence, label in zip(ordered_list, labels):
+    # ──────────────────────────────────────────────────────────────
+    # enumerate so we know which graph in `graphs` belongs here
+    # ──────────────────────────────────────────────────────────────
+    for sample_idx, (sentence, label) in enumerate(zip(ordered_list, labels)):
+
         pairs = prepare_contrastive_samples(sentence, label)
-        if pairs:
-            positive_samples, negative_samples = pairs
-            pos_enc = tokenizer(positive_samples)
-            neg_enc = tokenizer(negative_samples)
-            for pi, pa, ni, na in zip(pos_enc.input_ids, pos_enc.attention_mask, neg_enc.input_ids, neg_enc.attention_mask):
-                result.append({
-                    'pos_input_ids': pi,
-                    'pos_attention_mask': pa,
-                    'pos_labels': pi,
-                    'neg_input_ids': ni,
-                    'neg_attention_mask': na,
-                    'neg_labels': ni
-                })
+        if not pairs:
+            continue
+
+        positive_samples, negative_samples = pairs
+        pos_enc = tokenizer(positive_samples)
+        neg_enc = tokenizer(negative_samples)
+
+        for pi, pa, ni, na in zip(
+                pos_enc.input_ids, pos_enc.attention_mask,
+                neg_enc.input_ids, neg_enc.attention_mask):
+
+            result.append({
+                "pos_input_ids":      pi,
+                "pos_attention_mask": pa,
+                "pos_labels":         pi,
+                "neg_input_ids":      ni,
+                "neg_attention_mask": na,
+                "neg_labels":         ni,
+                "graph_idx":          sample_idx,   # ← NEW
+            })
+
     return result
+
 
 def remove_agreement(text, phrase=["I disagree", "I agree"]):
     sentences = text.split('. ')

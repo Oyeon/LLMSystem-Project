@@ -1,3 +1,5 @@
+
+
 import re
 import torch
 import datasets
@@ -19,87 +21,163 @@ class GraphDataset(Dataset):
     def get(self, idx):
         return self.data_list[idx]
 
+# class MAGDiDataCollator:
+
+#     def __init__(self,
+#                  tokenizer,
+#                  label_pad_token_id=-100):
+        
+#         self.tokenizer = tokenizer
+#         self.label_pad_token_id = label_pad_token_id
+
+#     def __call__(self, features):
+
+#         pos_labels = [feature["pos_labels"] for feature in features]
+#         neg_labels = [feature["neg_labels"] for feature in features]
+        
+#         graphs = [feature["graph"] for feature in features]
+#         max_pos_label_length = max(len(l) for l in pos_labels)
+#         max_neg_label_length = max(len(l) for l in neg_labels)
+        
+#         padding_side = self.tokenizer.padding_side
+#         for feature in features:
+
+#             pos_diff = (max_pos_label_length - len(feature["pos_labels"]))
+            
+#             pos_input_remainder = [self.tokenizer.pad_token_id
+#                          ] * pos_diff
+            
+#             pos_attn_remainder = [0] * pos_diff
+            
+#             pos_label_remainder = [self.label_pad_token_id
+#                          ] * pos_diff
+ 
+#             feature["pos_input_ids"] = (feature["pos_input_ids"] +
+#                                  pos_input_remainder if padding_side == "right"
+#                                  else pos_input_remainder + feature["pos_input_ids"])
+    
+#             feature["pos_attention_mask"] = (feature["pos_attention_mask"] +
+#                                  pos_attn_remainder if padding_side == "right"
+#                                  else pos_attn_remainder + feature["pos_attention_mask"])
+    
+#             feature["pos_labels"] = (feature["pos_labels"] +
+#                                  pos_label_remainder if padding_side == "right"
+#                                  else pos_label_remainder + feature["pos_labels"])
+
+#             neg_diff = (max_neg_label_length - len(feature["neg_labels"]))
+            
+#             neg_input_remainder = [self.tokenizer.pad_token_id
+#                          ] * neg_diff
+            
+#             neg_attn_remainder = [0] * neg_diff
+            
+#             neg_label_remainder = [self.label_pad_token_id
+#                          ] * neg_diff
+ 
+#             feature["neg_input_ids"] = (feature["neg_input_ids"] +
+#                                  neg_input_remainder if padding_side == "right"
+#                                  else neg_input_remainder + feature["neg_input_ids"])
+    
+#             feature["neg_attention_mask"] = (feature["neg_attention_mask"] +
+#                                  neg_attn_remainder if padding_side == "right"
+#                                  else neg_attn_remainder + feature["neg_attention_mask"])
+    
+#             feature["neg_labels"] = (feature["neg_labels"] +
+#                                  neg_label_remainder if padding_side == "right"
+#                                  else neg_label_remainder + feature["neg_labels"])
+    
+#         pos_input_ids = [feature["pos_input_ids"] for feature in features]
+#         pos_attention_mask = [feature["pos_attention_mask"] for feature in features]
+#         pos_labels = [feature["pos_labels"] for feature in features]
+        
+#         neg_input_ids = [feature["neg_input_ids"] for feature in features]
+#         neg_attention_mask = [feature["neg_attention_mask"] for feature in features]
+#         neg_labels = [feature["neg_labels"] for feature in features]
+        
+#         new_feat = {'pos_input_ids': torch.tensor(pos_input_ids, dtype=torch.long),
+#                     'pos_attention_mask': torch.tensor(pos_attention_mask, dtype=torch.long),
+#                     'pos_labels': torch.tensor(pos_labels, dtype=torch.long),
+#                     'neg_input_ids': torch.tensor(neg_input_ids, dtype=torch.long),
+#                     'neg_attention_mask': torch.tensor(neg_attention_mask, dtype=torch.long),
+#                     'neg_labels': torch.tensor(neg_labels, dtype=torch.long),
+#                     'graph': GraphDataset(graphs)}
+#         return new_feat
+
+
+# ------------------------------------------------------------------
+from typing import List, Dict, Any
+import torch
+from torch_geometric.data import Batch
+
 class MAGDiDataCollator:
+    """
+    Expects each item in `features` to look like
+        {
+          "pos_input_ids":      List[int],
+          "pos_attention_mask": List[int],
+          "pos_labels":         List[int],
+          "neg_input_ids":      List[int],
+          "neg_attention_mask": List[int],
+          "neg_labels":         List[int],
+          "graph_idx":          int              # index into `self.graphs`
+        }
+    Returns a single dict ready for MAGDi.forward, including a
+    torch_geometric.data.Batch under the key "graph".
+    """
 
-    def __init__(self,
-                 tokenizer,
-                 label_pad_token_id=-100):
-        
-        self.tokenizer = tokenizer
-        self.label_pad_token_id = label_pad_token_id
+    def __init__(self, tokenizer, graphs, label_pad_token_id: int = -100):
+        self.tok = tokenizer
+        self.graphs = graphs
+        self.label_pad_id = label_pad_token_id
 
-    def __call__(self, features):
+    # ------------------------------------------------------------------
+    def _pad_side(self, seq: List[int], target_len: int, pad_id: int) -> List[int]:
+        """Pad on the tokenizer's preferred side."""
+        diff = target_len - len(seq)
+        if diff <= 0:
+            return seq
+        pad_chunk = [pad_id] * diff
+        return seq + pad_chunk if self.tok.padding_side == "right" else pad_chunk + seq
 
-        pos_labels = [feature["pos_labels"] for feature in features]
-        neg_labels = [feature["neg_labels"] for feature in features]
-        
-        graphs = [feature["graph"] for feature in features]
-        max_pos_label_length = max(len(l) for l in pos_labels)
-        max_neg_label_length = max(len(l) for l in neg_labels)
-        
-        padding_side = self.tokenizer.padding_side
-        for feature in features:
+    # ------------------------------------------------------------------
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # ------------------------------------------------------------------
+        # 1) figure out max lengths
+        max_pos = max(len(f["pos_labels"]) for f in features)
+        max_neg = max(len(f["neg_labels"]) for f in features)
 
-            pos_diff = (max_pos_label_length - len(feature["pos_labels"]))
-            
-            pos_input_remainder = [self.tokenizer.pad_token_id
-                         ] * pos_diff
-            
-            pos_attn_remainder = [0] * pos_diff
-            
-            pos_label_remainder = [self.label_pad_token_id
-                         ] * pos_diff
- 
-            feature["pos_input_ids"] = (feature["pos_input_ids"] +
-                                 pos_input_remainder if padding_side == "right"
-                                 else pos_input_remainder + feature["pos_input_ids"])
-    
-            feature["pos_attention_mask"] = (feature["pos_attention_mask"] +
-                                 pos_attn_remainder if padding_side == "right"
-                                 else pos_attn_remainder + feature["pos_attention_mask"])
-    
-            feature["pos_labels"] = (feature["pos_labels"] +
-                                 pos_label_remainder if padding_side == "right"
-                                 else pos_label_remainder + feature["pos_labels"])
+        # ------------------------------------------------------------------
+        # 2) pad every sample in-place
+        for f in features:
+            f["pos_input_ids"]      = self._pad_side(f["pos_input_ids"],      max_pos, self.tok.pad_token_id)
+            f["pos_attention_mask"] = self._pad_side(f["pos_attention_mask"], max_pos, 0)
+            f["pos_labels"]         = self._pad_side(f["pos_labels"],         max_pos, self.label_pad_id)
 
-            neg_diff = (max_neg_label_length - len(feature["neg_labels"]))
-            
-            neg_input_remainder = [self.tokenizer.pad_token_id
-                         ] * neg_diff
-            
-            neg_attn_remainder = [0] * neg_diff
-            
-            neg_label_remainder = [self.label_pad_token_id
-                         ] * neg_diff
- 
-            feature["neg_input_ids"] = (feature["neg_input_ids"] +
-                                 neg_input_remainder if padding_side == "right"
-                                 else neg_input_remainder + feature["neg_input_ids"])
-    
-            feature["neg_attention_mask"] = (feature["neg_attention_mask"] +
-                                 neg_attn_remainder if padding_side == "right"
-                                 else neg_attn_remainder + feature["neg_attention_mask"])
-    
-            feature["neg_labels"] = (feature["neg_labels"] +
-                                 neg_label_remainder if padding_side == "right"
-                                 else neg_label_remainder + feature["neg_labels"])
-    
-        pos_input_ids = [feature["pos_input_ids"] for feature in features]
-        pos_attention_mask = [feature["pos_attention_mask"] for feature in features]
-        pos_labels = [feature["pos_labels"] for feature in features]
-        
-        neg_input_ids = [feature["neg_input_ids"] for feature in features]
-        neg_attention_mask = [feature["neg_attention_mask"] for feature in features]
-        neg_labels = [feature["neg_labels"] for feature in features]
-        
-        new_feat = {'pos_input_ids': torch.tensor(pos_input_ids, dtype=torch.long),
-                    'pos_attention_mask': torch.tensor(pos_attention_mask, dtype=torch.long),
-                    'pos_labels': torch.tensor(pos_labels, dtype=torch.long),
-                    'neg_input_ids': torch.tensor(neg_input_ids, dtype=torch.long),
-                    'neg_attention_mask': torch.tensor(neg_attention_mask, dtype=torch.long),
-                    'neg_labels': torch.tensor(neg_labels, dtype=torch.long),
-                    'graph': GraphDataset(graphs)}
-        return new_feat
+            f["neg_input_ids"]      = self._pad_side(f["neg_input_ids"],      max_neg, self.tok.pad_token_id)
+            f["neg_attention_mask"] = self._pad_side(f["neg_attention_mask"], max_neg, 0)
+            f["neg_labels"]         = self._pad_side(f["neg_labels"],         max_neg, self.label_pad_id)
+
+        # ------------------------------------------------------------------
+        # 3) stack numeric fields
+        def stack(key):
+            return torch.tensor([f[key] for f in features], dtype=torch.long)
+
+        batch_dict = {
+            "pos_input_ids":      stack("pos_input_ids"),
+            "pos_attention_mask": stack("pos_attention_mask"),
+            "pos_labels":         stack("pos_labels"),
+            "neg_input_ids":      stack("neg_input_ids"),
+            "neg_attention_mask": stack("neg_attention_mask"),
+            "neg_labels":         stack("neg_labels"),
+        }
+
+        # ------------------------------------------------------------------
+        # 4) collate graphs into a single PyG Batch
+        batch_graphs = [self.graphs[f["graph_idx"]] for f in features]
+        batch_dict["graph"] = Batch.from_data_list(batch_graphs)
+
+        return batch_dict
+
 
 def prepare_test_data(dataset):
     test_samples = json.load(open(f"test_data/{dataset}_test.json", "r"))  
